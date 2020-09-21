@@ -369,15 +369,16 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
 
     for g_m in range(0,nargs):
       if maps[g_m]==OP_GBL and accs[g_m]<>OP_READ and accs[g_m] <> OP_WRITE:
-        code('TYP ARG_l[DIM];')
-        if accs[g_m] == OP_INC:
-          FOR('d','0','DIM')
-          code('ARG_l[d]=ZERO_TYP;')
-          ENDFOR()
-        else:
-          FOR('d','0','DIM')
-          code('ARG_l[d]=ARG[d+blockIdx.x*DIM];')
-          ENDFOR()
+        if not reproducible:
+          code('TYP ARG_l[DIM];')
+          if accs[g_m] == OP_INC:
+            FOR('d','0','DIM')
+            code('ARG_l[d]=ZERO_TYP;')
+            ENDFOR()
+          else:
+            FOR('d','0','DIM')
+            code('ARG_l[d]=ARG[d+blockIdx.x*DIM];')
+            ENDFOR()
       elif maps[g_m]==OP_MAP and accs[g_m]==OP_INC and not op_color2:
         code('TYP ARG_l[DIM];')
 
@@ -606,6 +607,11 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
       code('')
       comm('process set elements')
       FOR_INC('n','threadIdx.x+blockIdx.x*blockDim.x','set_size','blockDim.x*gridDim.x')
+      for g_m in range (0,nargs):
+        if reproducible and reduct and maps[g_m]==OP_GBL and accs[g_m]<>OP_READ and accs[g_m]<>OP_WRITE:
+          FOR('d','0','DIM')
+          code('ARG[n+d]=ZERO_TYP;')
+          ENDFOR()
 
 #
 # kernel call
@@ -624,7 +630,10 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
         if accs[m] == OP_READ or accs[m] == OP_WRITE:
           line += rep(indent+'ARG,\n',m)
         else:
-          line += rep(indent+'ARG_l,\n',m);
+          if reproducible:
+            line += rep(indent+'ARG+n*DIM,\n',m)
+          else:
+            line += rep(indent+'ARG_l,\n',m);
         a =a+1
       elif maps[m]==OP_MAP and  accs[m]==OP_INC and not op_color2:
         if vectorised[m]:
@@ -753,7 +762,7 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
 #
 # global reduction
 #
-    if reduct:
+    if reduct and not reproducible:
        code('')
        comm('global reductions')
        code('')
@@ -882,7 +891,7 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
       code('printf(" kernel routine w/o indirection:  '+ name + '");')
       ENDIF()
       code('')
-      code('op_mpi_halo_exchanges_cuda(set, nargs, args);')
+      code('int set_size = op_mpi_halo_exchanges_cuda(set, nargs, args);')
 
 #
 # for reproducible incs method
@@ -986,20 +995,24 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
 
     if reduct:
       comm('transfer global reduction data to GPU')
-      if ninds>0:
-        code('int maxblocks = 0;')
-        FOR('col','0','Plan->ncolors')
-        code('maxblocks = MAX(maxblocks,Plan->ncolblk[col]);')
-        ENDFOR()
-      else:
-        code('int maxblocks = nblocks;')
+      if not reproducible:
+        if ninds>0:
+          code('int maxblocks = 0;')
+          FOR('col','0','Plan->ncolors')
+          code('maxblocks = MAX(maxblocks,Plan->ncolblk[col]);')
+          ENDFOR()
+        else:
+          code('int maxblocks = nblocks;')
 
       code('int reduct_bytes = 0;')
       code('int reduct_size  = 0;')
 
       for g_m in range(0,nargs):
         if maps[g_m]==OP_GBL and accs[g_m]<>OP_READ and accs[g_m]<>OP_WRITE:
-          code('reduct_bytes += ROUND_UP(maxblocks*DIM*sizeof(TYP));')
+          if reproducible:
+            code('reduct_bytes += ROUND_UP(set_size*ARG.size);')
+          else:
+            code('reduct_bytes += ROUND_UP(maxblocks*DIM*sizeof(TYP));')
           code('reduct_size   = MAX(reduct_size,sizeof(TYP));')
 
       code('reallocReductArrays(reduct_bytes);')
@@ -1009,19 +1022,22 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
         if maps[g_m]==OP_GBL and accs[g_m]<>OP_READ and accs[g_m]<>OP_WRITE:
           code('ARG.data   = OP_reduct_h + reduct_bytes;')
           code('ARG.data_d = OP_reduct_d + reduct_bytes;')
-          FOR('b','0','maxblocks')
-          FOR('d','0','DIM')
-          if accs[g_m]==OP_INC:
-            code('((TYP *)ARG.data)[d+b*DIM] = ZERO_TYP;')
+          if accs[g_m]==OP_INC and reproducible:
+            code('reduct_bytes += ROUND_UP(set_size*ARG.size);')
           else:
-            code('((TYP *)ARG.data)[d+b*DIM] = ARGh[d];')
-          ENDFOR()
-          ENDFOR()
-          code('reduct_bytes += ROUND_UP(maxblocks*DIM*sizeof(TYP));')
-      code('mvReductArraysToDevice(reduct_bytes);')
+            FOR('b','0','maxblocks')
+            FOR('d','0','DIM')
+            if accs[g_m]==OP_INC:
+              code('((TYP *)ARG.data)[d+b*DIM] = ZERO_TYP;')
+            else:
+              code('((TYP *)ARG.data)[d+b*DIM] = ARGh[d];')
+            ENDFOR()
+            ENDFOR()
+            code('reduct_bytes += ROUND_UP(maxblocks*DIM*sizeof(TYP));')
+      
+      if not reproducible:
+        code('mvReductArraysToDevice(reduct_bytes);')
       code('')
-
-
 
     if repro_if:
     #if repr_coloring:
@@ -1158,19 +1174,24 @@ def op2_gen_cuda_simple(master, date, consts, kernels,sets, macro_defs):
       for m in range(0,nargs):
         g_m = m
         if maps[m]==OP_GBL and accs[m]<>OP_READ and accs[m] <> OP_WRITE:
-          FOR('b','0','maxblocks')
-          FOR('d','0','DIM')
-          if accs[m]==OP_INC:
-            code('ARGh[d] = ARGh[d] + ((TYP *)ARG.data)[d+b*DIM];')
-          elif accs[m]==OP_MIN:
-            code('ARGh[d] = MIN(ARGh[d],((TYP *)ARG.data)[d+b*DIM]);')
-          elif accs[m]==OP_MAX:
-            code('ARGh[d] = MAX(ARGh[d],((TYP *)ARG.data)[d+b*DIM]);')
-          ENDFOR()
-          ENDFOR()
+          if reproducible:
+            code('reprLocalSum(&ARG,set_size,(double*)ARG.data);')
+            code('ARG.data = (char *)ARGh;')
+            code('op_mpi_repr_inc_reduce_double(&ARG,(double*)ARG.data);')
+          else:
+            FOR('b','0','maxblocks')
+            FOR('d','0','DIM')
+            if accs[m]==OP_INC:
+              code('ARGh[d] = ARGh[d] + ((TYP *)ARG.data)[d+b*DIM];')
+            elif accs[m]==OP_MIN:
+              code('ARGh[d] = MIN(ARGh[d],((TYP *)ARG.data)[d+b*DIM]);')
+            elif accs[m]==OP_MAX:
+              code('ARGh[d] = MAX(ARGh[d],((TYP *)ARG.data)[d+b*DIM]);')
+            ENDFOR()
+            ENDFOR()
 
-          code('ARG.data = (char *)ARGh;')
-          code('op_mpi_reduce(&ARG,ARGh);')
+            code('ARG.data = (char *)ARGh;')
+            code('op_mpi_reduce(&ARG,ARGh);')
           
     for g_m in range(0,nargs):
       if maps[g_m] == OP_GBL and accs[g_m] == OP_WRITE:
